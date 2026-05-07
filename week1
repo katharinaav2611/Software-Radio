@@ -1,0 +1,109 @@
+%% Transmisi Teks SDR - High Precision (Fixed Constellation Scaling)
+clear; clc; close all;
+
+%% 1. Parameter Utama
+fileName = 'gemink.txt'; 
+outputFileName = 'received_final_fixed.txt';
+fc = 2.3e9;      
+fs = 1e6;        
+gainVal = 35;    
+
+% Load Data
+if ~exist(fileName, 'file'), error('File %s tidak ditemukan!', fileName); end
+binData = file2bin(fileName); 
+binData = binData(:).'; 
+totalBits = length(binData);
+
+% Modulasi QPSK
+txSignal = bits2QPSK(binData);
+rrcTx = comm.RaisedCosineTransmitFilter('RolloffFactor', 0.5, ...
+    'FilterSpanInSymbols', 16, 'OutputSamplesPerSymbol', 4);
+txSignalFilt = step(rrcTx, txSignal);
+
+%% 2. Inisialisasi DSP Objects
+agc = comm.AGC('DesiredOutputPower', 1, 'MaxPowerGain', 60);
+rrcRx = comm.RaisedCosineReceiveFilter('RolloffFactor', 0.5, ...
+    'FilterSpanInSymbols', 16, 'InputSamplesPerSymbol', 4, 'DecimationFactor', 1);
+symbolSync = comm.SymbolSynchronizer('SamplesPerSymbol', 4);
+carrierSync = comm.CarrierSynchronizer('Modulation','QPSK', ...
+    'NormalizedLoopBandwidth', 0.001, 'SamplesPerSymbol', 1);
+
+%% 3. Transmisi Hardware (ADALM-PLUTO)
+try
+    fprintf('Mengunci Pluto pada FC: %.1f GHz...\n', fc/1e9);
+    tx = sdrtx('Pluto', 'CenterFrequency', fc, 'BasebandSampleRate', fs);
+    rx = sdrrx('Pluto', 'CenterFrequency', fc, 'BasebandSampleRate', fs, ...
+               'SamplesPerFrame', length(txSignalFilt)*80, ... 
+               'GainSource', 'Manual', 'Gain', gainVal, 'OutputDataType', 'double');
+    
+    fprintf('Mentransmisikan sinyal dengan Gain %d dB...\n', gainVal);
+    transmitRepeat(tx, txSignalFilt); 
+    pause(3); 
+    rxSignalRaw = step(rx);
+    release(tx); release(rx);
+catch ME
+    error('Koneksi Pluto Gagal: %s', ME.message);
+end
+
+%% 4. Digital Signal Processing Chain
+rxAgc = step(agc, rxSignalRaw);
+rxFilt = step(rrcRx, rxAgc);
+rxSync = step(symbolSync, rxFilt);
+rxFinal = step(carrierSync, rxSync);
+
+%% 5. Frame Sync & Rotation Correction
+rotations = [1, 1j, -1, -1j]; 
+bestBER = 1;
+bestBits = [];
+finalSignal = [];
+for r = 1:4
+    rotatedSignal = rxFinal * rotations(r);
+    decBitsAll = qpskdemod(real(rotatedSignal).', imag(rotatedSignal).', 1, length(rotatedSignal), 2);
+    
+    [cor, lag] = xcorr(decBitsAll(1:min(end,40000)), binData(1:min(end,1000)).');
+    [~, idx] = max(cor);
+    startIdx = abs(lag(idx)) + 1;
+    
+    if (startIdx + totalBits - 1) <= length(decBitsAll)
+        currentBits = decBitsAll(startIdx : startIdx + totalBits - 1);
+        currentBER = sum(binData(:) ~= currentBits(:)) / totalBits;
+        
+        if currentBER < bestBER
+            bestBER = currentBER;
+            bestBits = currentBits;
+            finalSignal = rotatedSignal;
+        end
+    end
+end
+
+%% 6. Visualisasi & Fixed Scaling (Agar Pas di 1 dan -1)
+if ~isempty(bestBits)
+    % --- PERBAIKAN SKALA DISINI ---
+    % Menghitung rata-rata amplitudo I dan Q secara terpisah agar kotak konstelasi sempurna
+    scale_factor = mean(abs([real(finalSignal); imag(finalSignal)]));
+    finalSignal = finalSignal / (scale_factor + 1e-9); 
+    % ------------------------------
+    
+    bin2file(bestBits, outputFileName);
+    fprintf('\n================ HASIL AKHIR ================\n');
+    fprintf('BER Akhir : %f\n', bestBER);
+    fprintf('=============================================\n');
+    
+    % Plot Konstelasi
+    figure('Name', 'Final Optimized Constellation', 'Color', [0.1 0.1 0.1]);
+    % Plot sampel di tengah agar sinkronisasi sudah stabil
+    sampleStart = floor(length(finalSignal)*0.2);
+    sampleEnd = sampleStart + 10000;
+    plot(finalSignal(sampleStart:min(sampleEnd, end)), '.', 'Color', [0 1 0.5], 'MarkerSize', 6); hold on;
+    
+    % Titik Target (Red Circles) Presisi di 1 dan -1
+    plot([1 -1 1 -1], [1 1 -1 -1], 'ro', 'LineWidth', 2, 'MarkerSize', 12);
+    
+    grid on; 
+    set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w', 'GridColor', [0.3 0.3 0.3]);
+    axis([-1.8 1.8 -1.8 1.8]); axis square;
+    title(['Final BER: ', num2str(bestBER)], 'Color', 'w');
+    xlabel('In-Phase (I)'); ylabel('Quadrature (Q)');
+else
+    disp('Gagal sinkronisasi. Cek fisik antena.');
+end
