@@ -1,0 +1,36 @@
+fprintf('Modulasi  : %d-QAM\n', M);
+   fprintf('BER Akhir : %f\n', bestBER);
+   fprintf('=============================================\n');
+  
+   % Setup Figure Lebar untuk 2 Subplot
+   figure('Name', sprintf('Constellation Analysis %d-QAM', M), ...
+          'Color', [0.1 0.1 0.1], 'Position', [100, 100, 1000, 500]);
+  
+   max_amp = max(abs(ideal_ref)) * 1.5;
+  
+   % --- KIRI: KONSTELASI IDEAL MURNI ---
+   subplot(1, 2, 1);
+   plot(real(ideal_ref), imag(ideal_ref), 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 8);
+   grid on; axis square;
+   set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w', 'GridColor', [0.3 0.3 0.3]);
+   axis([-max_amp max_amp -max_amp max_amp]);
+   title(sprintf('Ideal %d-QAM Grid', M), 'Color', 'w');
+   xlabel('In-Phase (I)', 'Color', 'w'); ylabel('Quadrature (Q)', 'Color', 'w');
+  
+   % --- KANAN: OUTPUT ASLI (Tanpa Titik Merah) ---
+   subplot(1, 2, 2);
+   % Trik Perbagus Tampilan: Ambil bagian paling AKHIR dari sinyal,
+   % di mana PLL & filter sudah mengunci dengan sempurna.
+   sampleEnd = length(finalSignal) - 1000;
+   sampleStart = max(1, sampleEnd - 15000); % Ambil 15000 titik paling stabil
+  
+   plot(finalSignal(sampleStart:sampleEnd), '.', 'Color', [0 1 0.5], 'MarkerSize', 5);
+   grid on; axis square;
+   set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w', 'GridColor', [0.3 0.3 0.3]);
+   axis([-max_amp max_amp -max_amp max_amp]);
+   title(sprintf('Received Signal (BER: %.4f)', bestBER), 'Color', 'w');
+   xlabel('In-Phase (I)', 'Color', 'w'); ylabel('Quadrature (Q)', 'Color', 'w');
+  
+else
+   disp('Gagal sinkronisasi. Sinyal terlalu buruk.');
+end
