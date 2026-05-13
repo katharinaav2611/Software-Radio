@@ -1,0 +1,189 @@
+%% Transmisi Teks SDR - M-QAM Universal (2 Pluto, High Performance)
+clear; clc; close all;
+
+%% 1. Parameter Utama
+fileName = 'gemink.txt';
+outputFileName = 'received_final_2pluto.txt';
+fc = 2.3e9;     
+fs = 1e6;       
+
+% Alamat IP Pluto
+uri_tx = 'ip:192.168.2.1';
+uri_rx = 'ip:192.168.3.1';
+M = 4 % BISA DIUBAH: 4, 16, atau 64
+k = log2(M);
+
+if ~exist(fileName, 'file'), error('File %s tidak ditemukan!', fileName); end
+binDataOriginal = file2bin(fileName);
+binDataOriginal = binDataOriginal(:).';
+totalBitsOriginal = length(binDataOriginal);
+
+% Zero-padding untuk kelipatan k
+padLength = mod(k - mod(totalBitsOriginal, k), k);
+if padLength > 0
+   binDataTx = [binDataOriginal, zeros(1, padLength)];
+else
+   binDataTx = binDataOriginal;
+end
+
+dataInMatrix = reshape(binDataTx, k, length(binDataTx)/k).';
+dataSymbolsIn = bi2de(dataInMatrix);
+txSignal = qammod(dataSymbolsIn, M);
+
+% Filter TX
+rrcTx = comm.RaisedCosineTransmitFilter('RolloffFactor', 0.5, ...
+   'FilterSpanInSymbols', 16, 'OutputSamplesPerSymbol', 4);
+txSignalFilt = step(rrcTx, txSignal);
+txSignalFilt = 0.8 * (txSignalFilt / max(abs(txSignalFilt))); % Anti-clipping
+
+%% 2. Inisialisasi DSP (Stabilized Version)
+rxGain = 45; 
+agc = comm.AGC('DesiredOutputPower', 1, 'MaxPowerGain', 60);
+
+rrcRx = comm.RaisedCosineReceiveFilter('RolloffFactor', 0.5, ...
+   'FilterSpanInSymbols', 20, 'InputSamplesPerSymbol', 4, 'DecimationFactor', 1);
+
+coarseSync = comm.CoarseFrequencyCompensator('Modulation', 'QAM', ...
+   'Algorithm', 'FFT-based', 'FrequencyResolution', 5, 'SampleRate', fs);
+
+symbolSync = comm.SymbolSynchronizer('TimingErrorDetector', 'Gardner (non-data-aided)', ...
+   'SamplesPerSymbol', 4, 'NormalizedLoopBandwidth', 0.005);
+
+carrierSync = comm.CarrierSynchronizer('Modulation','QAM', ...
+   'ModulationPhaseOffset', 'Auto', 'NormalizedLoopBandwidth', 0.01, 'SamplesPerSymbol', 1);
+
+%% 3. Transmisi Hardware
+try
+   fprintf('Inisialisasi Radio... (M = %d, Gain: %d dB)\n', M, rxGain);
+   tx = sdrtx('Pluto', 'RadioID', uri_tx, 'CenterFrequency', fc, 'BasebandSampleRate', fs);
+   rx = sdrrx('Pluto', 'RadioID', uri_rx, 'CenterFrequency', fc, 'BasebandSampleRate', fs, ...
+              'SamplesPerFrame', 100000, ... 
+              'GainSource', 'Manual', 'Gain', rxGain, 'OutputDataType', 'double');
+  
+   fprintf('Transmitting... Mohon tunggu sinkronisasi hardware.\n');
+   transmitRepeat(tx, txSignalFilt);
+   pause(6); 
+   
+   for i = 1:5, rxSignalRaw = step(rx); end 
+   
+   release(tx); release(rx);
+catch ME
+   error('Koneksi Pluto Gagal: %s', ME.message);
+end
+
+%% 4. DSP Chain Hardware
+rxAgc = step(agc, rxSignalRaw);
+rxFilt = step(rrcRx, rxAgc);
+rxCoarse = step(coarseSync, rxFilt);
+rxSync = step(symbolSync, rxCoarse);
+rxFinal = step(carrierSync, rxSync);
+
+%% 5. Frame Sync & Phase Correction
+ideal_ref = qammod(0:M-1, M);
+expected_power = mean(abs(ideal_ref).^2);
+actual_power = mean(abs(rxFinal).^2);
+rxFinal_scaled = rxFinal * sqrt(expected_power / (actual_power + 1e-9));
+
+rotations = [1, 1j, -1, -1j];
+bestBER = 1; bestBits = []; finalSignal = [];
+
+for r = 1:4
+   rotatedSignal = rxFinal_scaled * rotations(r);
+   decSymbols = qamdemod(rotatedSignal, M);
+   decMatrix = de2bi(decSymbols, k);
+   decBitsAll = reshape(decMatrix.', [], 1).';
+  
+   [cor, lag] = xcorr(decBitsAll(1:min(end,50000)), binDataOriginal(1:min(end,2000)));
+   [~, idx] = max(cor);
+   startIdx = abs(lag(idx)) + 1;
+  
+   if (startIdx + totalBitsOriginal - 1) <= length(decBitsAll)
+       currentBits = decBitsAll(startIdx : startIdx + totalBitsOriginal - 1);
+       currentBER = sum(binDataOriginal ~= currentBits) / totalBitsOriginal;
+       if currentBER < bestBER
+           bestBER = currentBER;
+           bestBits = currentBits;
+           finalSignal = rotatedSignal;
+       end
+   end
+end
+
+%% 6. Visualisasi High-Resolution
+if ~isempty(bestBits)
+   bin2file(bestBits, outputFileName);
+   fprintf('\n================ HASIL HARDWARE ================\n');
+   fprintf('BER Terukur : %.6f\n', bestBER);
+   fprintf('================================================\n');
+  
+   figure('Name', 'Optimized QAM Analysis', 'Color', [0.1 0.1 0.1], 'Position', [100, 100, 1400, 450]);
+   max_amp = max(abs(ideal_ref)) * 1.5;
+   subplot(1,3,1); plot(real(ideal_ref), imag(ideal_ref), 'rs', 'LineWidth', 2);
+   title('1. Ideal Grid', 'Color', 'w'); grid on; axis square;
+   set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w'); axis([-max_amp max_amp -max_amp max_amp]);
+   
+   subplot(1,3,2); plot(txSignal(1:min(end,3000)), '.', 'Color', [0 0.7 1]);
+   title('2. TX Symbols', 'Color', 'w'); grid on; axis square;
+   set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w'); axis([-max_amp max_amp -max_amp max_amp]);
+   
+   subplot(1,3,3);
+   idx_viz = max(1, length(finalSignal)-10000); 
+   plot(finalSignal(idx_viz:end), '.', 'Color', [0 1 0.4], 'MarkerSize', 4);
+   title(sprintf('3. RX Real (BER: %.4f)', bestBER), 'Color', 'w'); grid on; axis square;
+   set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w'); axis([-max_amp max_amp -max_amp max_amp]);
+else
+   disp('Gagal sinkronisasi hardware.');
+end
+
+%% 7. Analisis BER vs SNR (Optimized & Fixed)
+EbNo_range = 0:2:18; 
+ber_theory = berawgn(EbNo_range, 'qam', M);
+
+% --- FIX: Release objects sebelum masuk simulasi ---
+release(rrcRx); 
+release(symbolSync);
+release(carrierSync);
+
+ber_sim = zeros(size(EbNo_range));
+fprintf('\nMenghitung Kurva BER (Simulasi AWGN)... ');
+
+for i = 1:length(EbNo_range)
+    % 1. Tambahkan Noise (AWGN)
+    snr = EbNo_range(i) + 10*log10(k) - 10*log10(4); % k=bits/sym, 4=samples/sym
+    rx_noisy = awgn(txSignalFilt, snr, 'measured');
+    
+    % 2. Reset internal state setiap iterasi SNR agar independen
+    release(rrcRx); release(symbolSync);
+    
+    % 3. Proses DSP Simulasian
+    sig_filt = step(rrcRx, rx_noisy);
+    sig_sync = step(symbolSync, sig_filt);
+    
+    % 4. Normalisasi Amplitudo untuk Demodulasi
+    sig_norm = sig_sync / (max(abs(sig_sync)) + 1e-9) * max(abs(txSignal));
+    
+    % 5. Demodulasi & Hitung Error
+    decSyms = qamdemod(sig_norm, M);
+    decBits = de2bi(decSyms, k);
+    decBits = reshape(decBits.', [], 1).';
+    
+    % Potong agar panjangnya sama dengan data asli
+    minLen = min(length(decBits), length(binDataTx));
+    [~, ber_sim(i)] = biterr(binDataTx(1:minLen), decBits(1:minLen));
+end
+fprintf('Selesai.\n');
+
+% --- PLOT GRAFIK BER ---
+figure('Name', 'BER Performance Analysis', 'Color', 'w');
+semilogy(EbNo_range, ber_theory, 'b-o', 'LineWidth', 2, 'DisplayName', 'Teoritis'); 
+hold on; grid on;
+semilogy(EbNo_range, ber_sim, 'r--s', 'LineWidth', 1.5, 'DisplayName', 'Simulasi AWGN');
+
+% Plot Hasil Hardware (Actual) - Diposisikan pada SNR estimasi (~14 dB)
+if exist('bestBER', 'var') && ~isempty(bestBER)
+    semilogy(14, bestBER, 'kp', 'MarkerSize', 15, 'MarkerFaceColor', 'y', 'DisplayName', 'Hasil Real-Pluto');
+end
+
+xlabel('E_b/N_0 (dB)'); ylabel('Bit Error Rate (BER)');
+title(['Performa BER ', num2str(M), '-QAM: Teori vs Realita']);
+legend('Location', 'southwest');
+axis([min(EbNo_range) max(EbNo_range) 1e-6 1]);
