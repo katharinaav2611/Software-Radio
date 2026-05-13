@@ -1,0 +1,187 @@
+%% Transmisi Teks SDR - 64-QAM (Side-by-Side View & High Precision)
+clear; clc; close all;
+%% 1. Parameter Utama
+fileName = 'gemink.txt';
+outputFileName = 'received_final_sidebyside.txt';
+fc = 2.3e9;    
+fs = 1e6;      
+gainVal = 20;   % ← Naikkan untuk 64-QAM
+M = 64; % ✅ UBAH DI SINI: 4, 16, 64
+k = log2(M);
+if ~exist(fileName, 'file'), error('File %s tidak ditemukan!', fileName); end
+binDataOriginal = file2bin(fileName);
+binDataOriginal = binDataOriginal(:).';
+totalBitsOriginal = length(binDataOriginal);
+% Zero-padding agar ukuran bit sesuai dengan orde modulasi
+padLength = mod(k - mod(totalBitsOriginal, k), k);
+if padLength > 0
+  binDataTx = [binDataOriginal, zeros(1, padLength)];
+else
+  binDataTx = binDataOriginal;
+end
+dataInMatrix = reshape(binDataTx, k, length(binDataTx)/k).';
+dataSymbolsIn = bi2de(dataInMatrix);
+fprintf('\n========== TRANSMISI 64-QAM ==========\n');
+fprintf('Total Bits Asli     : %d\n', totalBitsOriginal);
+fprintf('Zero-Padding        : %d\n', padLength);
+fprintf('Total Bits Tx       : %d\n', length(binDataTx));
+fprintf('Total Symbols       : %d\n', length(dataSymbolsIn));
+fprintf('=====================================\n\n');
+% Modulasi murni (integer grid)
+txSignal = qammod(dataSymbolsIn, M);
+% ✅ RRC TRANSMIT - OPTIMIZED UNTUK 64-QAM
+rrcTx = comm.RaisedCosineTransmitFilter('RolloffFactor', 0.35, ...
+  'FilterSpanInSymbols', 32, 'OutputSamplesPerSymbol', 8);
+txSignalFilt = step(rrcTx, txSignal);
+% Anti-Clipping untuk Hardware (LEBIH KETAT untuk 64-QAM)
+txSignalFilt = 0.6 * (txSignalFilt / max(abs(txSignalFilt)));
+%% 2. Inisialisasi DSP
+fprintf('========== DSP PARAMETER ==========\n');
+fprintf('Modulasi             : %d-QAM\n', M);
+fprintf('Samples per Symbol   : 8 (Upsampling)\n');
+fprintf('RRC Rolloff Factor   : 0.35\n');
+fprintf('RRC Filter Span      : 32 symbols\n');
+fprintf('Carrier Loop BW      : 0.001 (normalized)\n');
+fprintf('Symbol Loop BW       : 0.01 (normalized)\n');
+fprintf('======================================\n\n');
+% ✅ AGC - SMOOTH ADAPTATION UNTUK 64-QAM
+agc = comm.AGC('DesiredOutputPower', 1, 'MaxPowerGain', 60, ...
+  'AveragingLength', 1000, 'AdaptationStepSize', 0.001);
+% ✅ RRC RECEIVE - MATCHED FILTER
+rrcRx = comm.RaisedCosineReceiveFilter('RolloffFactor', 0.35, ...
+  'FilterSpanInSymbols', 32, 'InputSamplesPerSymbol', 8, 'DecimationFactor', 1);
+% ✅ SYMBOL SYNCHRONIZER - GARDNER NON-DATA-AIDED
+symbolSync = comm.SymbolSynchronizer('SamplesPerSymbol', 8, ...
+  'TimingErrorDetector', 'Gardner (non-data-aided)', ...
+  'NormalizedLoopBandwidth', 0.01);
+% ✅ CARRIER SYNCHRONIZER - NARROW BANDWIDTH UNTUK PHASE NOISE TRACKING
+carrierSync = comm.CarrierSynchronizer('Modulation','QAM', ...
+  'ModulationPhaseOffset', 'Auto', ...
+  'NormalizedLoopBandwidth', 0.0005, ...
+  'SamplesPerSymbol', 1, 'DampingFactor', 1);
+%% 3. Transmisi Hardware (Loopback)
+try
+  fprintf('Mengunci Pluto pada FC: %.1f GHz...\n', fc/1e9);
+  tx = sdrtx('Pluto', 'RadioID', 'usb:0', 'CenterFrequency', fc, 'BasebandSampleRate', fs);
+  rx = sdrrx('Pluto', 'RadioID', 'usb:0', 'CenterFrequency', fc, 'BasebandSampleRate', fs, ...
+             'SamplesPerFrame', length(txSignalFilt)*80, ...
+             'GainSource', 'Manual', 'Gain', gainVal, 'OutputDataType', 'double');
+   fprintf('Mentransmisikan sinyal %d-QAM dengan Gain %.1f dB...\n', M, gainVal);
+  transmitRepeat(tx, txSignalFilt);
+  pause(3); % Tunggu hardware stabil
+ 
+  fprintf('Menerima sinyal...\n');
+  rxSignalRaw = step(rx);
+  release(tx);
+  release(rx);
+ 
+catch ME
+  error('Koneksi Pluto Gagal: %s', ME.message);
+end
+%% 4. DSP Chain - OPTIMIZED UNTUK 64-QAM
+fprintf('\n========== PEMROSESAN SINYAL TERIMA ==========\n');
+fprintf('1. AGC processing...');
+rxAgc = step(agc, rxSignalRaw);
+fprintf(' ✓\n');
+fprintf('2. RRC RX Filter processing...');
+rxFilt = step(rrcRx, rxAgc);
+fprintf(' ✓\n');
+fprintf('3. Symbol Synchronizer (Gardner)...');
+rxSync = step(symbolSync, rxFilt);
+fprintf(' ✓\n');
+fprintf('4. Carrier Synchronizer (Phase Tracking)...');
+rxFinal = step(carrierSync, rxSync);
+fprintf(' ✓\n');
+fprintf('=============================================\n\n');
+%% 5. Skala Otomatis ke Grid Integer & Sinkronisasi Frame
+ideal_ref = qammod(0:M-1, M);
+expected_power = mean(abs(ideal_ref).^2);
+actual_power = mean(abs(rxFinal).^2);
+rxFinal_scaled = rxFinal * sqrt(expected_power / (actual_power + 1e-9));
+% ✅ ESTIMASI SNR
+signal_power = mean(abs(rxFinal_scaled).^2);
+rotations = [1, 1j, -1, -1j];
+bestBER = 1;
+bestBits = [];
+finalSignal = [];
+bestRotation = 0;
+for r = 1:4
+  rotatedSignal = rxFinal_scaled * rotations(r);
+  decSymbols = qamdemod(rotatedSignal, M);
+  decMatrix = de2bi(decSymbols, k);
+  decBitsAll = reshape(decMatrix.', [], 1).';
+ 
+  [cor, lag] = xcorr(decBitsAll(1:min(end,40000)), binDataOriginal(1:min(end,1000)));
+  [~, idx] = max(cor);
+  startIdx = abs(lag(idx)) + 1;
+ 
+  if (startIdx + totalBitsOriginal - 1) <= length(decBitsAll)
+      currentBits = decBitsAll(startIdx : startIdx + totalBitsOriginal - 1);
+      currentBER = sum(binDataOriginal ~= currentBits) / totalBitsOriginal;
+     
+      if currentBER < bestBER
+          bestBER = currentBER;
+          bestBits = currentBits;
+          finalSignal = rotatedSignal;
+          bestRotation = r;
+      end
+  end
+end
+% ✅ HITUNG SNR DARI ERROR
+if ~isempty(bestBits)
+  decSymbolsFinal = qamdemod(finalSignal, M);
+  idealSymbolsFinal = qammod(decSymbolsFinal, M);
+  error_power = mean(abs(finalSignal - idealSymbolsFinal).^2);
+  snr_linear = signal_power / (error_power + 1e-12);
+  snr_db = 10 * log10(snr_linear);
+ 
+  % ✅ HITUNG PHASE OFFSET
+  phase_offset = angle(mean(finalSignal ./ (idealSymbolsFinal + 1e-9)));
+end
+%% 6. Visualisasi Side-by-Side
+if ~isempty(bestBits)
+  bin2file(bestBits, outputFileName);
+  fprintf('\n================ HASIL AKHIR ================\n');
+  fprintf('Modulasi  : %d-QAM\n', M);
+  fprintf('BER Akhir : %f\n', bestBER);
+  fprintf('=============================================\n');
+   % Setup Figure Lebar untuk 2 Subplot
+  figure('Name', sprintf('Constellation Analysis %d-QAM', M), ...
+         'Color', [0.1 0.1 0.1], 'Position', [100, 100, 1000, 500]);
+   max_amp = max(abs(ideal_ref)) * 1.5;
+   % --- KIRI: KONSTELASI IDEAL MURNI ---
+  subplot(1, 2, 1);
+  plot(real(ideal_ref), imag(ideal_ref), 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 8);
+  grid on; axis square;
+  set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w', 'GridColor', [0.3 0.3 0.3]);
+  axis([-max_amp max_amp -max_amp max_amp]);
+  title(sprintf('Ideal %d-QAM Grid', M), 'Color', 'w', 'FontSize', 12);
+  xlabel('In-Phase (I)', 'Color', 'w');
+  ylabel('Quadrature (Q)', 'Color', 'w');
+   % --- KANAN: OUTPUT ASLI (Tanpa Titik Merah) ---
+  subplot(1, 2, 2);
+  sampleEnd = length(finalSignal) - 500;
+  sampleStart = max(1, sampleEnd - 20000);
+   plot(finalSignal(sampleStart:sampleEnd), '.', 'Color', [0 1 0.5], 'MarkerSize', 5);
+  grid on; axis square;
+  set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w', 'GridColor', [0.3 0.3 0.3]);
+  axis([-max_amp max_amp -max_amp max_amp]);
+  title(sprintf('Received Signal (BER: %.4f)', bestBER), 'Color', 'w', 'FontSize', 12);
+  xlabel('In-Phase (I)', 'Color', 'w');
+  ylabel('Quadrature (Q)', 'Color', 'w');
+   % --- INFO TEXT (FIXED: Removed FontFamily) ---
+  signal_power = mean(abs(finalSignal).^2);
+  error_power = mean(abs(finalSignal - qammod(qamdemod(finalSignal, M), M)).^2);
+  snr_linear = signal_power / (error_power + 1e-9);
+  snr_db = 10 * log10(snr_linear);
+ 
+  info_text = sprintf(['M-QAM: %d | BER: %.4f | SNR: %.2f dB\n' ...
+                       'Samples: %d | Gain: %d dB'], ...
+                      M, bestBER, snr_db, length(finalSignal(sampleStart:sampleEnd)), gainVal);
+ 
+  % ✅ FIXED: Removed FontFamily, kept FontSize only
+  text(0.02, 0.98, info_text, 'Units', 'normalized', 'Color', 'w', ...
+     'FontSize', 9, 'FontWeight', 'bold', 'VerticalAlignment', 'top');
+ else
+  disp('Gagal sinkronisasi. Sinyal terlalu buruk.');
+end
